@@ -246,8 +246,9 @@ impl HostTcpSocketWithStore for WasiSockets {
             return Err(ErrorCode::AccessDenied.into());
         }
         let sock = store.with(|mut store| {
-            let socket = get_socket_mut(store.get().table, &socket)?;
-            let socket = socket.start_connect(&remote_address)?;
+            let ctx = store.get();
+            let socket = get_socket_mut(ctx.table, &socket)?;
+            let socket = socket.start_connect(&remote_address, &mut ctx.ctx.loopback)?;
             SocketResult::Ok(socket)
         })?;
 
@@ -255,8 +256,9 @@ impl HostTcpSocketWithStore for WasiSockets {
         // https://github.com/bytecodealliance/wasmtime/pull/11291#discussion_r2223917986
         let res = sock.connect(remote_address).await;
         store.with(|mut store| {
-            let socket = get_socket_mut(store.get().table, &socket)?;
-            socket.finish_connect(res)?;
+            let ctx = store.get();
+            let socket = get_socket_mut(ctx.table, &socket)?;
+            socket.finish_connect(res, &mut ctx.ctx.loopback)?;
             Ok(())
         })
     }
@@ -266,21 +268,28 @@ impl HostTcpSocketWithStore for WasiSockets {
         socket: Resource<TcpSocket>,
     ) -> SocketResult<StreamReader<Resource<TcpSocket>>> {
         let getter = store.getter();
-        let socket = get_socket_mut(store.get().table, &socket)?;
-        socket.start_listen()?;
+
+        let ctx = store.get();
+        let socket = get_socket_mut(ctx.table, &socket)?;
+        socket.start_listen(&mut ctx.ctx.loopback)?;
         socket.finish_listen()?;
-        let listener = socket.tcp_listener_arc().unwrap().clone();
-        let family = socket.address_family();
-        let options = socket.non_inherited_options().clone();
-        Ok(StreamReader::new(
-            &mut store,
-            ListenStreamProducer {
-                listener,
-                family,
-                options,
-                getter,
-            },
-        ))
+        match socket {
+            TcpSocket::Network(socket) => {
+                let listener = socket.tcp_listener_arc().unwrap().clone();
+                let family = socket.address_family();
+                let options = socket.non_inherited_options().clone();
+                Ok(StreamReader::new(
+                    &mut store,
+                    ListenStreamProducer {
+                        listener,
+                        family,
+                        options,
+                        getter,
+                    },
+                ))
+            }
+            TcpSocket::Loopback(..) => todo!(),
+        }
     }
 
     async fn send<T: 'static>(
@@ -289,18 +298,20 @@ impl HostTcpSocketWithStore for WasiSockets {
         data: StreamReader<u8>,
     ) -> SocketResult<()> {
         let (result_tx, result_rx) = oneshot::channel();
-        store.with(|mut store| {
-            let sock = get_socket(store.get().table, &socket)?;
-            let stream = sock.tcp_stream_arc()?;
-            let stream = Arc::clone(stream);
-            data.pipe(
-                store,
-                SendStreamConsumer {
-                    stream,
-                    result: Some(result_tx),
-                },
-            );
-            SocketResult::Ok(())
+        store.with(|mut store| match get_socket(store.get().table, &socket)? {
+            TcpSocket::Network(sock) => {
+                let stream = sock.tcp_stream_arc()?;
+                let stream = Arc::clone(stream);
+                data.pipe(
+                    store,
+                    SendStreamConsumer {
+                        stream,
+                        result: Some(result_tx),
+                    },
+                );
+                SocketResult::Ok(())
+            }
+            TcpSocket::Loopback(..) => todo!(),
         })?;
         result_rx
             .await
@@ -350,7 +361,7 @@ impl HostTcpSocket for WasiSocketsCtxView<'_> {
             return Err(ErrorCode::AccessDenied.into());
         }
         let socket = get_socket_mut(self.table, &socket)?;
-        socket.start_bind(local_address)?;
+        socket.start_bind(local_address, &mut self.ctx.loopback)?;
         socket.finish_bind()?;
         Ok(())
     }
@@ -409,7 +420,7 @@ impl HostTcpSocket for WasiSocketsCtxView<'_> {
         socket: Resource<TcpSocket>,
         value: bool,
     ) -> SocketResult<()> {
-        let sock = get_socket(self.table, &socket)?;
+        let sock = get_socket_mut(self.table, &socket)?;
         sock.set_keep_alive_enabled(value)?;
         Ok(())
     }
@@ -439,7 +450,7 @@ impl HostTcpSocket for WasiSocketsCtxView<'_> {
         socket: Resource<TcpSocket>,
         value: Duration,
     ) -> SocketResult<()> {
-        let sock = get_socket(self.table, &socket)?;
+        let sock = get_socket_mut(self.table, &socket)?;
         sock.set_keep_alive_interval(value)?;
         Ok(())
     }
@@ -454,7 +465,7 @@ impl HostTcpSocket for WasiSocketsCtxView<'_> {
         socket: Resource<TcpSocket>,
         value: u32,
     ) -> SocketResult<()> {
-        let sock = get_socket(self.table, &socket)?;
+        let sock = get_socket_mut(self.table, &socket)?;
         sock.set_keep_alive_count(value)?;
         Ok(())
     }
