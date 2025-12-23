@@ -29,7 +29,9 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
             .await?;
 
         // Bind to the address.
-        self.table.get_mut(&this)?.start_bind(local_address)?;
+        self.table
+            .get_mut(&this)?
+            .start_bind(local_address, &mut self.ctx.loopback)?;
 
         Ok(())
     }
@@ -57,7 +59,7 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
         // Start connection
         let socket = self.table.get_mut(&this)?;
         let future = socket
-            .start_connect(&remote_address)?
+            .start_connect(&remote_address, &mut self.ctx.loopback)?
             .connect(remote_address);
         socket.set_pending_connect(future)?;
 
@@ -73,7 +75,7 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
         let result = socket
             .take_pending_connect()?
             .ok_or(ErrorCode::WouldBlock)?;
-        socket.finish_connect(result)?;
+        socket.finish_connect(result, &mut self.ctx.loopback)?;
         let (input, output) = socket.p2_streams()?;
         let input = self.table.push_child(input, &this)?;
         let output = self.table.push_child(output, &this)?;
@@ -83,7 +85,7 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
     fn start_listen(&mut self, this: Resource<TcpSocket>) -> SocketResult<()> {
         let socket = self.table.get_mut(&this)?;
 
-        socket.start_listen()?;
+        socket.start_listen(&mut self.ctx.loopback)?;
         Ok(())
     }
 
@@ -157,7 +159,7 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
         this: Resource<TcpSocket>,
         value: bool,
     ) -> SocketResult<()> {
-        let socket = self.table.get(&this)?;
+        let socket = self.table.get_mut(&this)?;
         socket.set_keep_alive_enabled(value)?;
         Ok(())
     }
@@ -187,7 +189,7 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
         this: Resource<TcpSocket>,
         value: u64,
     ) -> SocketResult<()> {
-        let socket = self.table.get(&this)?;
+        let socket = self.table.get_mut(&this)?;
         socket.set_keep_alive_interval(value)?;
         Ok(())
     }
@@ -198,7 +200,7 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
     }
 
     fn set_keep_alive_count(&mut self, this: Resource<TcpSocket>, value: u32) -> SocketResult<()> {
-        let socket = self.table.get(&this)?;
+        let socket = self.table.get_mut(&this)?;
         socket.set_keep_alive_count(value)?;
         Ok(())
     }
@@ -244,29 +246,59 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
         wasmtime_wasi_io::poll::subscribe(self.table, this)
     }
 
-    fn shutdown(
+    async fn shutdown(
         &mut self,
         this: Resource<TcpSocket>,
         shutdown_type: ShutdownType,
     ) -> SocketResult<()> {
         let socket = self.table.get(&this)?;
 
-        let how = match shutdown_type {
-            ShutdownType::Receive => std::net::Shutdown::Read,
-            ShutdownType::Send => std::net::Shutdown::Write,
-            ShutdownType::Both => std::net::Shutdown::Both,
-        };
-
-        let state = socket.p2_streaming_state()?;
-        state.shutdown(how)?;
-        Ok(())
+        match socket {
+            TcpSocket::Network(socket) => {
+                let how = match shutdown_type {
+                    ShutdownType::Receive => std::net::Shutdown::Read,
+                    ShutdownType::Send => std::net::Shutdown::Write,
+                    ShutdownType::Both => std::net::Shutdown::Both,
+                };
+                let state = socket.p2_streaming_state()?;
+                state.shutdown(how)?;
+                Ok(())
+            }
+            TcpSocket::Loopback(socket) => {
+                use crate::sockets::loopback::TcpState;
+                match &socket.state {
+                    TcpState::P2Streaming { tx, rx, .. } => {
+                        match shutdown_type {
+                            ShutdownType::Receive => {
+                                if let Some(mut rx) = rx.lock().await.take() {
+                                    rx.close();
+                                }
+                            }
+                            ShutdownType::Send => {
+                                tx.lock().unwrap().take();
+                            }
+                            ShutdownType::Both => {
+                                tx.lock().unwrap().take();
+                                if let Some(mut rx) = rx.lock().await.take() {
+                                    rx.close();
+                                }
+                            }
+                        }
+                        Ok(())
+                    }
+                    //#[cfg(feature = "p3")]
+                    //TcpState::Error(err) => Err(err.into()),
+                    _ => Err(ErrorCode::InvalidState.into()),
+                }
+            }
+        }
     }
 
     fn drop(&mut self, this: Resource<TcpSocket>) -> Result<(), anyhow::Error> {
         // As in the filesystem implementation, we assume closing a socket
         // doesn't block.
-        let dropped = self.table.delete(this)?;
-        drop(dropped);
+        let socket = self.table.delete(this)?;
+        socket.drop(&mut self.ctx.loopback)?;
 
         Ok(())
     }
@@ -490,7 +522,9 @@ pub mod sync {
             self_: Resource<TcpSocket>,
             shutdown_type: ShutdownType,
         ) -> Result<(), SocketError> {
-            AsyncHostTcpSocket::shutdown(self, self_, shutdown_type.into())
+            in_tokio(async {
+                AsyncHostTcpSocket::shutdown(self, self_, shutdown_type.into()).await
+            })
         }
 
         fn drop(&mut self, rep: Resource<TcpSocket>) -> wasmtime::Result<()> {

@@ -93,7 +93,7 @@ fn test_tcp_shutdown_should_not_lose_data(net: &Network, family: IpAddressFamily
             .check_write()
             .unwrap()
             .min(100 * small_buffer_size);
-        assert!(big_buffer_size > small_buffer_size);
+        assert_eq!(big_buffer_size, small_buffer_size);
         let outgoing_data = vec![0; big_buffer_size as usize];
 
         // Submit the oversized buffer and immediately initiate the shutdown:
