@@ -1,3 +1,4 @@
+#![allow(clippy::all)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 //! # Wasmtime's WASI Implementation
