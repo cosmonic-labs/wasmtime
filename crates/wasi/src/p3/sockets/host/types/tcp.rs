@@ -248,7 +248,8 @@ impl HostTcpSocketWithStore for WasiSockets {
         let sock = store.with(|mut store| {
             let ctx = store.get();
             let socket = get_socket_mut(ctx.table, &socket)?;
-            let socket = socket.start_connect(&remote_address, &mut ctx.ctx.loopback)?;
+            let mut loopback = ctx.ctx.loopback.lock().unwrap();
+            let socket = socket.start_connect(&remote_address, &mut loopback)?;
             SocketResult::Ok(socket)
         })?;
 
@@ -258,7 +259,8 @@ impl HostTcpSocketWithStore for WasiSockets {
         store.with(|mut store| {
             let ctx = store.get();
             let socket = get_socket_mut(ctx.table, &socket)?;
-            socket.finish_connect(res, &mut ctx.ctx.loopback)?;
+            let mut loopback = ctx.ctx.loopback.lock().unwrap();
+            socket.finish_connect(res, &mut loopback)?;
             Ok(())
         })
     }
@@ -271,7 +273,10 @@ impl HostTcpSocketWithStore for WasiSockets {
 
         let ctx = store.get();
         let socket = get_socket_mut(ctx.table, &socket)?;
-        socket.start_listen(&mut ctx.ctx.loopback)?;
+        {
+            let mut loopback = ctx.ctx.loopback.lock().unwrap();
+            socket.start_listen(&mut loopback)?;
+        }
         socket.finish_listen()?;
         match socket {
             TcpSocket::Network(socket) => {
@@ -361,7 +366,8 @@ impl HostTcpSocket for WasiSocketsCtxView<'_> {
             return Err(ErrorCode::AccessDenied.into());
         }
         let socket = get_socket_mut(self.table, &socket)?;
-        socket.start_bind(local_address, &mut self.ctx.loopback)?;
+        let mut loopback = self.ctx.loopback.lock().unwrap();
+        socket.start_bind(local_address, &mut loopback)?;
         socket.finish_bind()?;
         Ok(())
     }

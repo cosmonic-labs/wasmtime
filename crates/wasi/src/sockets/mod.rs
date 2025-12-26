@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use wasmtime::component::{HasData, ResourceTable};
 
-pub(crate) mod loopback;
+pub mod loopback;
 mod tcp;
 mod udp;
 pub(crate) mod util;
@@ -71,7 +71,7 @@ pub(crate) const MAX_UDP_DATAGRAM_SIZE: usize = u16::MAX as usize;
 pub struct WasiSocketsCtx {
     pub(crate) socket_addr_check: SocketAddrCheck,
     pub(crate) allowed_network_uses: AllowedNetworkUses,
-    pub(crate) loopback: loopback::Network,
+    pub(crate) loopback: Arc<std::sync::Mutex<loopback::Network>>,
 }
 
 pub struct WasiSocketsCtxView<'a> {
