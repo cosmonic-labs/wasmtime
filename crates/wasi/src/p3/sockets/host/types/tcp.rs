@@ -268,7 +268,8 @@ impl HostTcpSocketWithStore for WasiSockets {
         let sock = store.with(|mut store| {
             let ctx = store.get();
             let socket = get_socket_mut(ctx.table, &socket)?;
-            let socket = socket.start_connect(&remote_address, &mut ctx.ctx.loopback)?;
+            let mut loopback = ctx.ctx.loopback.lock().unwrap();
+            let socket = socket.start_connect(&remote_address, &mut loopback)?;
             SocketResult::Ok(socket)
         })?;
 
@@ -278,7 +279,8 @@ impl HostTcpSocketWithStore for WasiSockets {
         store.with(|mut store| {
             let ctx = store.get();
             let socket = get_socket_mut(ctx.table, &socket)?;
-            socket.finish_connect(res, &mut ctx.ctx.loopback)?;
+            let mut loopback = ctx.ctx.loopback.lock().unwrap();
+            socket.finish_connect(res, &mut loopback)?;
             Ok(())
         })
     }

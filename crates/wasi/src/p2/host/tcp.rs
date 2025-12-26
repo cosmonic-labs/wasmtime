@@ -28,10 +28,11 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
             .check_socket_addr(local_address, SocketAddrUse::TcpBind)
             .await?;
 
+        let mut loopback = self.ctx.loopback.lock().unwrap();
         // Bind to the address.
         self.table
             .get_mut(&this)?
-            .start_bind(local_address, &mut self.ctx.loopback)?;
+            .start_bind(local_address, &mut loopback)?;
 
         Ok(())
     }
@@ -58,8 +59,9 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
 
         // Start connection
         let socket = self.table.get_mut(&this)?;
+        let mut loopback = self.ctx.loopback.lock().unwrap();
         let future = socket
-            .start_connect(&remote_address, &mut self.ctx.loopback)?
+            .start_connect(&remote_address, &mut loopback)?
             .connect(remote_address);
         socket.set_pending_connect(future)?;
 
@@ -75,7 +77,8 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
         let result = socket
             .take_pending_connect()?
             .ok_or(ErrorCode::WouldBlock)?;
-        socket.finish_connect(result, &mut self.ctx.loopback)?;
+        let mut loopback = self.ctx.loopback.lock().unwrap();
+        socket.finish_connect(result, &mut loopback)?;
         let (input, output) = socket.p2_streams()?;
         let input = self.table.push_child(input, &this)?;
         let output = self.table.push_child(output, &this)?;
@@ -84,8 +87,8 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
 
     fn start_listen(&mut self, this: Resource<TcpSocket>) -> SocketResult<()> {
         let socket = self.table.get_mut(&this)?;
-
-        socket.start_listen(&mut self.ctx.loopback)?;
+        let mut loopback = self.ctx.loopback.lock().unwrap();
+        socket.start_listen(&mut loopback)?;
         Ok(())
     }
 
@@ -298,7 +301,8 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
         // As in the filesystem implementation, we assume closing a socket
         // doesn't block.
         let socket = self.table.delete(this)?;
-        socket.drop(&mut self.ctx.loopback)?;
+        let mut loopback = self.ctx.loopback.lock().unwrap();
+        socket.drop(&mut loopback)?;
 
         Ok(())
     }
