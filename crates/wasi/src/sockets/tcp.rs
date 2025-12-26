@@ -905,7 +905,7 @@ impl TcpSocket {
         if !is_valid_unicast_address(ip) || !is_valid_address_family(ip, socket.family) {
             return Err(ErrorCode::InvalidArgument);
         }
-        if ip.is_loopback() {
+        if ip.is_loopback() || ip.is_unspecified() {
             let addr = loopback.start_bind(addr)?;
             let socket = super::loopback::TcpSocket::new(
                 socket,
