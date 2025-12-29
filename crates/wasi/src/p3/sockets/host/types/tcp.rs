@@ -349,6 +349,9 @@ impl HostTcpSocketWithStore for WasiSockets {
         let instance = store.instance();
         store.with(|mut store| {
             let socket = get_socket_mut(store.get().table, &socket)?;
+            let TcpSocket::Network(socket) = socket else {
+                todo!()
+            };
             match socket.start_receive() {
                 Some(stream) => {
                     let stream = Arc::clone(stream);

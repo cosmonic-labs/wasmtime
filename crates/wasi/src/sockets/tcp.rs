@@ -432,7 +432,7 @@ impl NetworkTcpSocket {
     }
 
     #[cfg(feature = "p3")]
-    fn start_receive(&mut self) -> Option<&Arc<tokio::net::TcpStream>> {
+    pub(crate) fn start_receive(&mut self) -> Option<&Arc<tokio::net::TcpStream>> {
         match mem::replace(&mut self.tcp_state, TcpState::Closed) {
             TcpState::Connected(stream) => {
                 self.tcp_state = TcpState::Receiving(stream);
@@ -791,6 +791,56 @@ mod does_not_inherit_options {
     }
 }
 
+impl super::loopback::TcpSocket {
+    pub fn new(
+        socket: &NetworkTcpSocket,
+        state: super::loopback::TcpState,
+    ) -> Result<Self, ErrorCode> {
+        let fd = &*socket.as_std_view()?;
+
+        let keep_alive_enabled = sockopt::socket_keepalive(fd)?;
+
+        let keep_alive_idle_time = sockopt::tcp_keepidle(fd)?;
+        let keep_alive_idle_time = keep_alive_idle_time
+            .as_nanos()
+            .try_into()
+            .unwrap_or(u64::MAX);
+
+        let keep_alive_interval = sockopt::tcp_keepintvl(fd)?;
+        let keep_alive_interval = keep_alive_interval
+            .as_nanos()
+            .try_into()
+            .unwrap_or(u64::MAX);
+
+        let keep_alive_count = sockopt::tcp_keepcnt(fd)?;
+
+        let hop_limit = get_unicast_hop_limit(fd, socket.family)?;
+
+        let receive_buffer_size = receive_buffer_size(fd)?;
+
+        let send_buffer_size = send_buffer_size(fd)?;
+        let send_buffer_size = send_buffer_size
+            .try_into()
+            .unwrap_or(Self::MAX_SEND_BUFFER_SIZE);
+
+        let listen_backlog_size = socket
+            .listen_backlog_size
+            .min(Self::MAX_LISTEN_BACKLOG_SIZE);
+        Ok(Self {
+            state,
+            send_buffer_size,
+            receive_buffer_size,
+            listen_backlog_size,
+            keep_alive_enabled,
+            keep_alive_idle_time,
+            keep_alive_interval,
+            keep_alive_count,
+            hop_limit,
+            family: socket.family,
+        })
+    }
+}
+
 pub enum TcpSocket {
     Network(NetworkTcpSocket),
     Loopback(super::loopback::TcpSocket),
@@ -822,53 +872,6 @@ impl ConnectingTcpSocket {
                 },
             }
         }
-    }
-}
-
-impl super::loopback::TcpSocket {
-    pub fn new(
-        socket: &NetworkTcpSocket,
-        state: super::loopback::TcpState,
-    ) -> Result<Self, ErrorCode> {
-        let fd = &*socket.as_std_view()?;
-
-        let keep_alive_enabled = sockopt::socket_keepalive(fd)?;
-
-        let keep_alive_idle_time = sockopt::tcp_keepidle(fd)?;
-        let keep_alive_idle_time = keep_alive_idle_time
-            .as_nanos()
-            .try_into()
-            .unwrap_or(u64::MAX);
-
-        let keep_alive_interval = sockopt::tcp_keepintvl(fd)?;
-        let keep_alive_interval = keep_alive_interval
-            .as_nanos()
-            .try_into()
-            .unwrap_or(u64::MAX);
-
-        let keep_alive_count = sockopt::tcp_keepcnt(fd)?;
-
-        let hop_limit = get_unicast_hop_limit(fd, socket.family)?;
-
-        let receive_buffer_size = receive_buffer_size(fd)?;
-
-        let send_buffer_size = send_buffer_size(fd)?;
-        let send_buffer_size = send_buffer_size
-            .try_into()
-            .unwrap_or(super::loopback::TcpSocket::MAX_SEND_BUFFER_SIZE);
-
-        Ok(Self {
-            state,
-            send_buffer_size,
-            receive_buffer_size,
-            listen_backlog_size: socket.listen_backlog_size,
-            keep_alive_enabled,
-            keep_alive_idle_time,
-            keep_alive_interval,
-            keep_alive_count,
-            hop_limit,
-            family: socket.family,
-        })
     }
 }
 
@@ -906,7 +909,7 @@ impl TcpSocket {
             return Err(ErrorCode::InvalidArgument);
         }
         if ip.is_loopback() || ip.is_unspecified() {
-            let addr = loopback.start_bind(addr)?;
+            let addr = loopback.bind_tcp(addr)?;
             let socket = super::loopback::TcpSocket::new(
                 socket,
                 super::loopback::TcpState::BindStarted(addr),
@@ -955,9 +958,9 @@ impl TcpSocket {
 
                     let mut local_address = *addr;
                     local_address.set_port(0);
-                    let local_address = loopback.start_bind(local_address)?;
+                    let local_address = loopback.bind_tcp(local_address)?;
 
-                    let tx = loopback.connect(addr)?;
+                    let tx = loopback.connect_tcp(addr)?;
 
                     let socket = super::loopback::TcpSocket::new(
                         socket,
@@ -1031,14 +1034,6 @@ impl TcpSocket {
         match self {
             Self::Network(socket) => socket.accept().map(|sock| sock.map(Self::Network)),
             Self::Loopback(socket) => socket.accept().map(|sock| sock.map(Self::Loopback)),
-        }
-    }
-
-    #[cfg(feature = "p3")]
-    pub(crate) fn start_receive(&mut self) -> Option<&Arc<tokio::net::TcpStream>> {
-        match self {
-            Self::Network(socket) => socket.start_receive(),
-            Self::Loopback(socket) => socket.start_receive(),
         }
     }
 
