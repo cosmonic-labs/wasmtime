@@ -330,27 +330,30 @@ impl HostTcpSocketWithStore for WasiSockets {
         socket: Resource<TcpSocket>,
     ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), ErrorCode>>)> {
         let socket = get_socket_mut(store.get().table, &socket)?;
-        match socket.start_receive() {
-            Some(stream) => {
-                let stream = Arc::clone(stream);
-                let (result_tx, result_rx) = oneshot::channel();
-                Ok((
-                    StreamReader::new(
-                        &mut store,
-                        ReceiveStreamProducer {
-                            stream,
-                            result: Some(result_tx),
-                        },
-                    ),
-                    FutureReader::new(&mut store, result_rx),
-                ))
-            }
-            None => Ok((
-                StreamReader::new(&mut store, iter::empty()),
-                FutureReader::new(&mut store, async {
-                    anyhow::Ok(Err(ErrorCode::InvalidState))
-                }),
-            )),
+        match socket {
+            TcpSocket::Network(socket) => match socket.start_receive() {
+                Some(stream) => {
+                    let stream = Arc::clone(stream);
+                    let (result_tx, result_rx) = oneshot::channel();
+                    Ok((
+                        StreamReader::new(
+                            &mut store,
+                            ReceiveStreamProducer {
+                                stream,
+                                result: Some(result_tx),
+                            },
+                        ),
+                        FutureReader::new(&mut store, result_rx),
+                    ))
+                }
+                None => Ok((
+                    StreamReader::new(&mut store, iter::empty()),
+                    FutureReader::new(&mut store, async {
+                        anyhow::Ok(Err(ErrorCode::InvalidState))
+                    }),
+                )),
+            },
+            TcpSocket::Loopback(_socket) => todo!(),
         }
     }
 }

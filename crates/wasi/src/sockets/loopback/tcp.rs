@@ -1,20 +1,25 @@
 use crate::runtime::with_ambient_tokio_runtime;
 use crate::sockets::SocketAddressFamily;
+use crate::sockets::loopback::Network;
 use crate::sockets::tcp::ConnectingTcpStream;
 use crate::sockets::util::ErrorCode;
 use anyhow::Context as _;
 use bytes::Bytes;
-use core::future::Future;
 use core::mem;
-use core::net::{IpAddr, SocketAddr};
+use core::net::SocketAddr;
 use core::num::NonZeroU16;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
-use std::collections::{HashMap, hash_map};
+use std::collections::hash_map;
 use std::sync::Arc;
 use tokio::sync::mpsc::error::TryRecvError;
-use tokio::sync::{Mutex, mpsc};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+
+#[derive(Debug)]
+pub enum TcpEndpoint {
+    Bound,
+    Listening(mpsc::Sender<TcpConn>),
+}
 
 pub struct TcpConn {
     pub local_address: SocketAddr,
@@ -42,72 +47,6 @@ impl TcpConn {
                 tx: remote_tx,
             },
         )
-    }
-}
-
-#[derive(Debug)]
-pub enum TcpEndpoint {
-    Bound,
-    Listening(mpsc::Sender<TcpConn>),
-}
-
-#[derive(Default)]
-pub struct Network {
-    pub ipv4: HashMap<NonZeroU16, TcpEndpoint>,
-    pub ipv6: HashMap<NonZeroU16, TcpEndpoint>,
-}
-
-impl Network {
-    fn get_net(&self, ip: IpAddr) -> &HashMap<NonZeroU16, TcpEndpoint> {
-        let Self { ipv4, ipv6 } = self;
-        match ip {
-            IpAddr::V4(..) => ipv4,
-            IpAddr::V6(..) => ipv6,
-        }
-    }
-
-    fn get_net_mut(&mut self, ip: IpAddr) -> &mut HashMap<NonZeroU16, TcpEndpoint> {
-        let Self { ipv4, ipv6 } = self;
-        match ip {
-            IpAddr::V4(..) => ipv4,
-            IpAddr::V6(..) => ipv6,
-        }
-    }
-
-    pub fn start_bind(&mut self, mut addr: SocketAddr) -> Result<SocketAddr, ErrorCode> {
-        let net = self.get_net_mut(addr.ip());
-        if let Some(port) = NonZeroU16::new(addr.port()) {
-            let hash_map::Entry::Vacant(entry) = net.entry(port) else {
-                return Err(ErrorCode::AddressInUse);
-            };
-            entry.insert(TcpEndpoint::Bound);
-            Ok(addr)
-        } else {
-            (1..=u16::MAX)
-                .rev()
-                .filter_map(|port| {
-                    let port = NonZeroU16::new(port)?;
-                    let hash_map::Entry::Vacant(entry) = net.entry(port) else {
-                        return None;
-                    };
-                    entry.insert(TcpEndpoint::Bound);
-                    addr.set_port(port.into());
-                    Some(addr)
-                })
-                .next()
-                .ok_or(ErrorCode::AddressInUse)
-        }
-    }
-
-    pub fn connect(&mut self, addr: &SocketAddr) -> Result<&mpsc::Sender<TcpConn>, ErrorCode> {
-        let net = self.get_net(addr.ip());
-        let Some(port) = NonZeroU16::new(addr.port()) else {
-            return Err(ErrorCode::InvalidArgument);
-        };
-        let Some(TcpEndpoint::Listening(tx)) = net.get(&port) else {
-            return Err(ErrorCode::ConnectionRefused);
-        };
-        Ok(tx)
     }
 }
 
@@ -142,7 +81,7 @@ pub enum TcpState {
         remote_address: SocketAddr,
         accepted: bool,
         permits: Arc<Semaphore>,
-        rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<(Bytes, OwnedSemaphorePermit)>>>>,
+        rx: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<(Bytes, OwnedSemaphorePermit)>>>>,
         tx: Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<(Bytes, OwnedSemaphorePermit)>>>>,
     },
     Closed,
@@ -162,7 +101,8 @@ pub struct TcpSocket {
 }
 
 impl TcpSocket {
-    pub const MAX_SEND_BUFFER_SIZE: u32 = i32::MAX as _;
+    pub const MAX_SEND_BUFFER_SIZE: u32 = 0x1_0000;
+    pub const MAX_LISTEN_BACKLOG_SIZE: u32 = 4096;
 
     pub fn finish_bind(&mut self) -> Result<(), ErrorCode> {
         match self.state {
@@ -182,7 +122,7 @@ impl TcpSocket {
         let TcpState::Bound(local_address) = self.state else {
             return Err(ErrorCode::InvalidState);
         };
-        let tx = loopback.connect(addr)?;
+        let tx = loopback.connect_tcp(addr)?;
         self.state = TcpState::Connecting {
             local_address,
             remote_address: *addr,
@@ -281,7 +221,7 @@ impl TcpSocket {
             }
             Err(err) => {
                 self.state = TcpState::Closed;
-                let net = loopback.get_net_mut(local_address.ip());
+                let net = loopback.get_tcp_net_mut(local_address.ip());
                 let Some(port) = NonZeroU16::new(local_address.port()) else {
                     return Err(ErrorCode::InvalidState);
                 };
@@ -297,7 +237,7 @@ impl TcpSocket {
         let TcpState::Bound(addr) = self.state else {
             return Err(ErrorCode::InvalidState);
         };
-        let net = loopback.get_net_mut(addr.ip());
+        let net = loopback.get_tcp_net_mut(addr.ip());
         let Some(port) = NonZeroU16::new(addr.port()) else {
             return Err(ErrorCode::InvalidArgument);
         };
@@ -308,11 +248,8 @@ impl TcpSocket {
             return Err(ErrorCode::InvalidState);
         };
 
-        let cap = self
-            .listen_backlog_size
-            .try_into()
-            .unwrap_or(Semaphore::MAX_PERMITS)
-            .min(Semaphore::MAX_PERMITS);
+        let cap = self.listen_backlog_size.min(Self::MAX_LISTEN_BACKLOG_SIZE);
+        let cap = cap.try_into().unwrap_or(Semaphore::MAX_PERMITS);
         let (tx, rx) = mpsc::channel(cap);
         entry.insert(TcpEndpoint::Listening(tx));
         self.state = TcpState::ListenStarted {
@@ -378,11 +315,6 @@ impl TcpSocket {
             send_buffer_size: self.send_buffer_size,
             family: self.family,
         }))
-    }
-
-    #[cfg(feature = "p3")]
-    pub fn start_receive(&mut self) -> Option<&Arc<tokio::net::TcpStream>> {
-        todo!()
     }
 
     pub fn local_address(&self) -> Result<SocketAddr, ErrorCode> {
@@ -516,7 +448,10 @@ impl TcpSocket {
         if value == 0 {
             return Err(ErrorCode::InvalidArgument);
         }
-        let mut value = value.try_into().unwrap_or(Self::MAX_SEND_BUFFER_SIZE);
+        let mut value = value
+            .try_into()
+            .unwrap_or(Self::MAX_SEND_BUFFER_SIZE)
+            .min(Self::MAX_SEND_BUFFER_SIZE);
         if let TcpState::P2Streaming { permits, .. } = &self.state {
             let surplus = self.send_buffer_size.saturating_sub(value);
             if surplus > 0 {
@@ -586,7 +521,7 @@ impl TcpSocket {
             | TcpState::P2Streaming { accepted: true, .. }
             | TcpState::Closed => return Ok(()),
         };
-        let net = loopback.get_net_mut(addr.ip());
+        let net = loopback.get_tcp_net_mut(addr.ip());
         let port = NonZeroU16::new(addr.port()).context("local address port cannot be 0")?;
         net.remove(&port);
         Ok(())

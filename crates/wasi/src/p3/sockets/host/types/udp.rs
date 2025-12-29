@@ -80,7 +80,8 @@ impl HostUdpSocket for WasiSocketsCtxView<'_> {
             return Err(ErrorCode::AccessDenied.into());
         }
         let socket = get_socket_mut(self.table, &socket)?;
-        socket.bind(local_address)?;
+        let mut loopback = self.ctx.loopback.lock().unwrap();
+        socket.bind(local_address, &mut loopback)?;
         socket.finish_bind()?;
         Ok(())
     }
@@ -95,7 +96,8 @@ impl HostUdpSocket for WasiSocketsCtxView<'_> {
             return Err(ErrorCode::AccessDenied.into());
         }
         let socket = get_socket_mut(self.table, &socket)?;
-        socket.connect(remote_address)?;
+        let mut loopback = self.ctx.loopback.lock().unwrap();
+        socket.connect(remote_address, &mut loopback)?;
         Ok(())
     }
 
@@ -109,7 +111,8 @@ impl HostUdpSocket for WasiSocketsCtxView<'_> {
 
     fn disconnect(&mut self, socket: Resource<UdpSocket>) -> SocketResult<()> {
         let socket = get_socket_mut(self.table, &socket)?;
-        socket.disconnect()?;
+        let mut loopback = self.ctx.loopback.lock().unwrap();
+        socket.disconnect(&mut loopback)?;
         Ok(())
     }
 
@@ -141,7 +144,7 @@ impl HostUdpSocket for WasiSocketsCtxView<'_> {
         socket: Resource<UdpSocket>,
         value: u8,
     ) -> SocketResult<()> {
-        let sock = get_socket(self.table, &socket)?;
+        let sock = get_socket_mut(self.table, &socket)?;
         sock.set_unicast_hop_limit(value)?;
         Ok(())
     }
@@ -156,7 +159,7 @@ impl HostUdpSocket for WasiSocketsCtxView<'_> {
         socket: Resource<UdpSocket>,
         value: u64,
     ) -> SocketResult<()> {
-        let sock = get_socket(self.table, &socket)?;
+        let sock = get_socket_mut(self.table, &socket)?;
         sock.set_receive_buffer_size(value)?;
         Ok(())
     }
@@ -171,7 +174,7 @@ impl HostUdpSocket for WasiSocketsCtxView<'_> {
         socket: Resource<UdpSocket>,
         value: u64,
     ) -> SocketResult<()> {
-        let sock = get_socket(self.table, &socket)?;
+        let sock = get_socket_mut(self.table, &socket)?;
         sock.set_send_buffer_size(value)?;
         Ok(())
     }

@@ -434,7 +434,9 @@ impl InputStream for LoopbackInputStream {
     fn read(&mut self, size: usize) -> Result<bytes::Bytes, StreamError> {
         use tokio::sync::mpsc::error::TryRecvError;
 
-        let mut rx = self.rx.try_lock().unwrap();
+        let Ok(mut rx) = self.rx.try_lock() else {
+            return Err(StreamError::Closed);
+        };
         let Some(rx) = rx.as_mut() else {
             return Err(StreamError::Closed);
         };
