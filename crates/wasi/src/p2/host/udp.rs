@@ -85,9 +85,11 @@ impl udp::HostUdpSocket for WasiSocketsCtxView<'_> {
             let mut loopback = self.ctx.loopback.lock().unwrap();
             socket.connect(connect_addr, &mut loopback)?;
         }
+        let is_loopback = remote_address.map(|addr| addr.ip().to_canonical().is_loopback());
 
-        let (incoming_stream, outgoing_stream) = match socket {
-            UdpSocket::Network(socket) => (
+        let (incoming_stream, outgoing_stream) = match (socket, is_loopback) {
+            (UdpSocket::Network(socket), ..)
+            | (UdpSocket::Unspecified { net: socket, .. }, Some(false)) => (
                 IncomingDatagramStream::Network(crate::p2::udp::NetworkIncomingDatagramStream {
                     inner: socket.socket().clone(),
                     remote_address,
@@ -100,36 +102,36 @@ impl udp::HostUdpSocket for WasiSocketsCtxView<'_> {
                     socket_addr_check: socket.socket_addr_check().cloned(),
                 }),
             ),
-            UdpSocket::Loopback(crate::sockets::loopback::UdpSocket {
-                state:
-                    crate::sockets::loopback::UdpState::Bound {
-                        local_address,
-                        rx,
-                        permits,
-                    }
-                    | crate::sockets::loopback::UdpState::Connected {
-                        local_address,
-                        rx,
-                        permits,
-                        ..
+            (UdpSocket::Loopback(socket), ..)
+            | (UdpSocket::Unspecified { lo: socket, .. }, Some(true)) => {
+                let (rx, tx) = socket.p2_udp_streams(remote_address)?;
+                (
+                    IncomingDatagramStream::Loopback(rx),
+                    OutgoingDatagramStream::Loopback(tx),
+                )
+            }
+            (UdpSocket::Unspecified { lo, net }, None) => {
+                let (lo_rx, lo_tx) = lo.p2_udp_streams(remote_address)?;
+                (
+                    IncomingDatagramStream::Unspecified {
+                        lo: lo_rx,
+                        net: crate::p2::udp::NetworkIncomingDatagramStream {
+                            inner: net.socket().clone(),
+                            remote_address,
+                        },
                     },
-                ..
-            }) => (
-                IncomingDatagramStream::Loopback(crate::p2::udp::LoopbackIncomingDatagramStream {
-                    remote_address,
-                    rx: std::sync::Arc::clone(rx),
-                    received: None,
-                }),
-                OutgoingDatagramStream::Loopback(crate::p2::udp::LoopbackOutgoingDatagramStream {
-                    local_address: *local_address,
-                    remote_address,
-                    permits: std::sync::Arc::clone(permits),
-                    permit: None,
-                    family: socket.address_family(),
-                    socket_addr_check: socket.socket_addr_check().cloned(),
-                }),
-            ),
-            UdpSocket::Loopback(..) => return Err(ErrorCode::InvalidState.into()),
+                    OutgoingDatagramStream::Unspecified {
+                        lo: lo_tx,
+                        net: crate::p2::udp::NetworkOutgoingDatagramStream {
+                            inner: net.socket().clone(),
+                            remote_address,
+                            family: net.address_family(),
+                            send_state: SendState::Idle,
+                            socket_addr_check: net.socket_addr_check().cloned(),
+                        },
+                    },
+                )
+            }
         };
         Ok((
             self.table.push_child(incoming_stream, &this)?,
@@ -258,27 +260,12 @@ impl udp::HostIncomingDatagramStream for WasiSocketsCtxView<'_> {
         let stream = match stream {
             IncomingDatagramStream::Network(stream) => stream,
             IncomingDatagramStream::Loopback(stream) => {
-                let Ok(mut rx) = stream.rx.try_lock() else {
-                    return Err(ErrorCode::Unknown.into());
-                };
-
-                let mut rx = core::iter::chain(
-                    stream.received.take(),
-                    core::iter::from_fn(|| rx.try_recv().ok()),
-                );
-                while datagrams.len() < max_results {
-                    let Some((dgram, _permit)) = rx.next() else {
-                        break;
-                    };
-                    match stream.remote_address {
-                        Some(connected_addr) if connected_addr != dgram.source_address => continue,
-                        _ => datagrams.push(udp::IncomingDatagram {
-                            data: dgram.data,
-                            remote_address: dgram.source_address.into(),
-                        }),
-                    }
-                }
+                stream.recv(&mut datagrams, max_results)?;
                 return Ok(datagrams);
+            }
+            IncomingDatagramStream::Unspecified { net, lo } => {
+                lo.recv(&mut datagrams, max_results)?;
+                net
             }
         };
 
@@ -332,6 +319,25 @@ impl Pollable for IncomingDatagramStream {
                 stream.received = rx.recv().await;
                 return;
             }
+            IncomingDatagramStream::Unspecified { net, lo } => {
+                let mut lo_rx = lo.rx.lock().await;
+                let mut net_ready = core::pin::pin!(async {
+                    // FIXME: Add `Interest::ERROR` when we update to tokio 1.32.
+                    net.inner
+                        .ready(Interest::READABLE)
+                        .await
+                        .expect("failed to await UDP socket readiness");
+                });
+                core::future::poll_fn(|cx| match lo_rx.poll_recv(cx) {
+                    core::task::Poll::Ready(received) => {
+                        lo.received = received;
+                        core::task::Poll::Ready(())
+                    }
+                    core::task::Poll::Pending => net_ready.as_mut().poll(cx),
+                })
+                .await;
+                return;
+            }
         };
         // FIXME: Add `Interest::ERROR` when we update to tokio 1.32.
         stream
@@ -345,25 +351,16 @@ impl Pollable for IncomingDatagramStream {
 impl udp::HostOutgoingDatagramStream for WasiSocketsCtxView<'_> {
     fn check_send(&mut self, this: Resource<udp::OutgoingDatagramStream>) -> SocketResult<u64> {
         let stream = self.table.get_mut(&this)?;
+        let is_unspecified = matches!(stream, &mut OutgoingDatagramStream::Unspecified { .. });
         let stream = match stream {
             OutgoingDatagramStream::Network(stream) => stream,
-            OutgoingDatagramStream::Loopback(crate::p2::udp::LoopbackOutgoingDatagramStream {
-                permit: Some(..),
-                ..
-            }) => return Ok(1),
-            OutgoingDatagramStream::Loopback(crate::p2::udp::LoopbackOutgoingDatagramStream {
-                permits,
-                permit,
-                ..
-            }) => match std::sync::Arc::clone(permits)
-                .try_acquire_many_owned(permits.available_permits() as _)
-            {
-                Ok(p) => {
-                    *permit = Some(p);
-                    return Ok(1);
+            OutgoingDatagramStream::Loopback(lo) => return Ok(lo.check_send().into()),
+            OutgoingDatagramStream::Unspecified { net, lo } => {
+                if !lo.check_send() {
+                    return Ok(0);
                 }
-                Err(..) => return Ok(0),
-            },
+                net
+            }
         };
 
         let permit = match stream.send_state {
@@ -375,7 +372,9 @@ impl udp::HostOutgoingDatagramStream for WasiSocketsCtxView<'_> {
             SendState::Permitted(n) => n,
             SendState::Waiting => 0,
         };
-
+        if permit > 1 && is_unspecified {
+            return Ok(1);
+        }
         Ok(permit.try_into().unwrap())
     }
 
@@ -418,18 +417,11 @@ impl udp::HostOutgoingDatagramStream for WasiSocketsCtxView<'_> {
             Ok(addr)
         }
 
-        async fn send_one(
+        fn send_one_net(
             stream: &crate::p2::udp::NetworkOutgoingDatagramStream,
             datagram: &udp::OutgoingDatagram,
+            addr: SocketAddr,
         ) -> SocketResult<()> {
-            let addr = prepare_one(
-                stream.remote_address,
-                stream.family,
-                stream.socket_addr_check.as_ref(),
-                datagram,
-            )
-            .await?;
-
             if stream.remote_address == Some(addr) {
                 stream.inner.try_send(&datagram.data)?;
             } else {
@@ -439,9 +431,50 @@ impl udp::HostOutgoingDatagramStream for WasiSocketsCtxView<'_> {
             Ok(())
         }
 
+        async fn send_one_lo(
+            stream: &mut crate::p2::udp::LoopbackOutgoingDatagramStream,
+            datagram: udp::OutgoingDatagram,
+            loopback: &std::sync::Mutex<crate::sockets::loopback::Network>,
+        ) -> SocketResult<()> {
+            let addr = prepare_one(
+                stream.remote_address,
+                stream.family,
+                stream.socket_addr_check.as_ref(),
+                &datagram,
+            )
+            .await?;
+            let Some(mut permit) = stream.permit.take() else {
+                return Err(SocketError::trap(anyhow::anyhow!(
+                    "unpermitted: must call check-send first"
+                )));
+            };
+            if permit.num_permits() < datagram.data.len() {
+                return Err(ErrorCode::DatagramTooLarge.into());
+            }
+            let required = core::num::NonZeroUsize::new(datagram.data.len())
+                .unwrap_or(core::num::NonZeroUsize::MIN);
+            let Some(unused) = permit.num_permits().checked_sub(required.into()) else {
+                return Err(ErrorCode::DatagramTooLarge.into());
+            };
+            if unused > 0 {
+                _ = permit.split(unused);
+            }
+            let mut loopback = loopback.lock().unwrap();
+            if let Some(tx) = loopback.connect_udp(&stream.local_address, &addr)? {
+                _ = tx.send((
+                    crate::sockets::loopback::UdpDatagram {
+                        source_address: stream.local_address,
+                        data: datagram.data,
+                    },
+                    permit,
+                ));
+            }
+            Ok(())
+        }
+
         let stream = self.table.get_mut(&this)?;
-        let stream = match stream {
-            OutgoingDatagramStream::Network(stream) => stream,
+        let (mut lo, stream) = match stream {
+            OutgoingDatagramStream::Network(stream) => (None, stream),
             OutgoingDatagramStream::Loopback(stream) => {
                 let mut datagrams = datagrams.into_iter();
                 let datagram = match core::array::from_fn(|_| datagrams.next()) {
@@ -453,40 +486,16 @@ impl udp::HostOutgoingDatagramStream for WasiSocketsCtxView<'_> {
                         )));
                     }
                 };
-                let addr = prepare_one(
-                    stream.remote_address,
-                    stream.family,
-                    stream.socket_addr_check.as_ref(),
-                    &datagram,
-                )
-                .await?;
-                let Some(mut permit) = stream.permit.take() else {
-                    return Err(SocketError::trap(anyhow::anyhow!(
-                        "unpermitted: must call check-send first"
-                    )));
-                };
-                if permit.num_permits() < datagram.data.len() {
-                    return Err(ErrorCode::DatagramTooLarge.into());
-                }
-                let required = core::num::NonZeroUsize::new(datagram.data.len())
-                    .unwrap_or(core::num::NonZeroUsize::MIN);
-                let Some(unused) = permit.num_permits().checked_sub(required.into()) else {
-                    return Err(ErrorCode::DatagramTooLarge.into());
-                };
-                if unused > 0 {
-                    _ = permit.split(unused);
-                }
-                let mut loopback = self.ctx.loopback.lock().unwrap();
-                if let Some(tx) = loopback.connect_udp(&stream.local_address, &addr)? {
-                    _ = tx.send((
-                        crate::sockets::loopback::UdpDatagram {
-                            source_address: stream.local_address,
-                            data: datagram.data,
-                        },
-                        permit,
-                    ));
-                }
+                send_one_lo(stream, datagram, &self.ctx.loopback).await?;
                 return Ok(1);
+            }
+            OutgoingDatagramStream::Unspecified { lo, net } => {
+                if datagrams.len() > 1 {
+                    return Err(SocketError::trap(anyhow::anyhow!(
+                        "unpermitted: argument exceeds permitted size"
+                    )));
+                }
+                (Some(lo), net)
             }
         };
 
@@ -513,7 +522,22 @@ impl udp::HostOutgoingDatagramStream for WasiSocketsCtxView<'_> {
         let mut count = 0;
 
         for datagram in datagrams {
-            match send_one(stream, &datagram).await {
+            let addr = prepare_one(
+                stream.remote_address,
+                stream.family,
+                stream.socket_addr_check.as_ref(),
+                &datagram,
+            )
+            .await?;
+
+            if addr.ip().to_canonical().is_loopback() {
+                if let Some(stream) = lo.as_mut() {
+                    send_one_lo(stream, datagram, &self.ctx.loopback).await?;
+                    count += 1;
+                    continue;
+                }
+            }
+            match send_one_net(stream, &datagram, addr) {
                 Ok(_) => count += 1,
                 Err(_) if count > 0 => {
                     // WIT: "If at least one datagram has been sent successfully, this function never returns an error."
@@ -559,6 +583,12 @@ impl Pollable for OutgoingDatagramStream {
                     _ = stream.permits.acquire().await;
                 }
                 return;
+            }
+            OutgoingDatagramStream::Unspecified { net, lo } => {
+                if lo.permit.is_none() {
+                    _ = lo.permits.acquire().await;
+                }
+                net
             }
         };
         match stream.send_state {
