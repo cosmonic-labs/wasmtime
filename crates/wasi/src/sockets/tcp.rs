@@ -908,6 +908,7 @@ impl TcpSocket {
         if !is_valid_unicast_address(ip) || !is_valid_address_family(ip, socket.family) {
             return Err(ErrorCode::InvalidArgument);
         }
+        let ip = ip.to_canonical();
         if ip.is_loopback() || ip.is_unspecified() {
             let addr = loopback.bind_tcp(addr)?;
             let socket = super::loopback::TcpSocket::new(
@@ -949,7 +950,7 @@ impl TcpSocket {
                     return Err(ErrorCode::InvalidArgument);
                 };
 
-                if addr.ip().is_loopback() {
+                if addr.ip().to_canonical().is_loopback() {
                     // TODO: Query socket opts
                     if let TcpState::Bound(..) = socket.tcp_state {
                         // socket wasn't bound to loopback

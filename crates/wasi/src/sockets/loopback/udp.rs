@@ -1,3 +1,4 @@
+use crate::p2;
 use crate::sockets::loopback::Network;
 use crate::sockets::util::{ErrorCode, is_valid_address_family, is_valid_remote_address};
 use crate::sockets::{SocketAddrCheck, SocketAddressFamily};
@@ -48,6 +49,51 @@ pub struct UdpSocket {
 
 impl UdpSocket {
     pub const MAX_SEND_BUFFER_SIZE: u32 = 0x1_0000;
+
+    pub fn p2_udp_streams(
+        &self,
+        remote_address: Option<SocketAddr>,
+    ) -> Result<
+        (
+            p2::udp::LoopbackIncomingDatagramStream,
+            p2::udp::LoopbackOutgoingDatagramStream,
+        ),
+        ErrorCode,
+    > {
+        let Self {
+            state:
+                UdpState::Bound {
+                    local_address,
+                    rx,
+                    permits,
+                }
+                | UdpState::Connected {
+                    local_address,
+                    rx,
+                    permits,
+                    ..
+                },
+            ..
+        } = self
+        else {
+            return Err(ErrorCode::InvalidState.into());
+        };
+        Ok((
+            p2::udp::LoopbackIncomingDatagramStream {
+                remote_address,
+                rx: Arc::clone(rx),
+                received: None,
+            },
+            p2::udp::LoopbackOutgoingDatagramStream {
+                local_address: *local_address,
+                remote_address,
+                permits: Arc::clone(permits),
+                permit: None,
+                family: self.address_family(),
+                socket_addr_check: self.socket_addr_check().cloned(),
+            },
+        ))
+    }
 
     pub fn finish_bind(&mut self) -> Result<(), ErrorCode> {
         match mem::replace(&mut self.state, UdpState::Closed) {
