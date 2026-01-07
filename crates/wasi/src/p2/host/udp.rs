@@ -1,9 +1,6 @@
 use crate::p2::bindings::sockets::network::{ErrorCode, IpAddressFamily, IpSocketAddress, Network};
 use crate::p2::bindings::sockets::udp;
-use crate::p2::udp::{
-    IncomingDatagramStream, NetworkIncomingDatagramStream, NetworkOutgoingDatagramStream,
-    OutgoingDatagramStream, SendState,
-};
+use crate::p2::udp::{IncomingDatagramStream, OutgoingDatagramStream, SendState};
 use crate::p2::{Pollable, SocketError, SocketResult};
 use crate::sockets::util::{is_valid_address_family, is_valid_remote_address};
 use crate::sockets::{
@@ -95,7 +92,7 @@ impl udp::HostUdpSocket for WasiSocketsCtxView<'_> {
                     inner: socket.socket().clone(),
                     remote_address,
                 }),
-                OutgoingDatagramStream::Network(NetworkOutgoingDatagramStream {
+                OutgoingDatagramStream::Network(crate::p2::udp::NetworkOutgoingDatagramStream {
                     inner: socket.socket().clone(),
                     remote_address,
                     family: socket.address_family(),
@@ -229,7 +226,7 @@ impl udp::HostIncomingDatagramStream for WasiSocketsCtxView<'_> {
     ) -> SocketResult<Vec<udp::IncomingDatagram>> {
         // Returns Ok(None) when the message was dropped.
         fn recv_one(
-            stream: &NetworkIncomingDatagramStream,
+            stream: &crate::p2::udp::NetworkIncomingDatagramStream,
         ) -> SocketResult<Option<udp::IncomingDatagram>> {
             let mut buf = [0; MAX_UDP_DATAGRAM_SIZE];
             let (size, received_addr) = stream.inner.try_recv_from(&mut buf)?;
