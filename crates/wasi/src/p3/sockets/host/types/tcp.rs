@@ -294,6 +294,7 @@ impl HostTcpSocketWithStore for WasiSockets {
                 ))
             }
             TcpSocket::Loopback(..) => todo!(),
+            TcpSocket::Unspecified { .. } => todo!(),
         }
     }
 
@@ -317,6 +318,7 @@ impl HostTcpSocketWithStore for WasiSockets {
                 SocketResult::Ok(())
             }
             TcpSocket::Loopback(..) => todo!(),
+            TcpSocket::Unspecified { .. } => todo!(),
         })?;
         result_rx
             .await
@@ -354,6 +356,7 @@ impl HostTcpSocketWithStore for WasiSockets {
                 )),
             },
             TcpSocket::Loopback(_socket) => todo!(),
+            TcpSocket::Unspecified { .. } => todo!(),
         }
     }
 }

@@ -294,6 +294,7 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
                     _ => Err(ErrorCode::InvalidState.into()),
                 }
             }
+            TcpSocket::Unspecified { .. } => Err(ErrorCode::InvalidState.into()),
         }
     }
 

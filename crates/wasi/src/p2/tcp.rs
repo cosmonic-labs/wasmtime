@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 impl TcpSocket {
     pub(crate) fn p2_streams(&mut self) -> SocketResult<(DynInputStream, DynOutputStream)> {
         match self {
-            TcpSocket::Network(socket) => {
+            Self::Network(socket) => {
                 let client = socket.tcp_stream_arc()?;
                 let reader = Arc::new(Mutex::new(TcpReader::new(client.clone())));
                 let writer = Arc::new(Mutex::new(TcpWriter::new(client.clone())));
@@ -29,7 +29,7 @@ impl TcpSocket {
                 let output: DynOutputStream = Box::new(TcpWriteStream(writer));
                 Ok((input, output))
             }
-            TcpSocket::Loopback(socket) => {
+            Self::Loopback(socket) => {
                 use crate::sockets::loopback::{TcpConn, TcpState};
                 let state = mem::replace(&mut socket.state, TcpState::Closed);
                 let TcpState::Connected {
@@ -64,6 +64,7 @@ impl TcpSocket {
                 let output: DynOutputStream = Box::new(LoopbackOutputStream { tx, permits });
                 Ok((input, output))
             }
+            Self::Unspecified { .. } => Err(crate::sockets::util::ErrorCode::InvalidState.into()),
         }
     }
 }
